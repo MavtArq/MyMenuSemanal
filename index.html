@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#2f7d4f">
+  <meta name="description" content="Planifica tus menús, controla la despensa y genera la lista de la compra.">
+  <title>Menú Semanal</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icono-192.png">
+  <link rel="apple-touch-icon" href="icons/icono-192.png">
+  <link rel="stylesheet" href="css/estilos.css">
+  <script src="vendor/sql-wasm.js"></script>
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+
+  <header class="barra">
+    <h1 id="titulo">Menú semanal</h1>
+    <button id="btn-ajustes" class="icono" aria-label="Ajustes">⚙️</button>
+  </header>
+
+  <main>
+    <p id="cargando" class="vacio">Cargando base de datos…</p>
+
+    <!-- ============ MENÚ ============ -->
+    <section id="vista-menu" class="vista">
+      <div class="navegador-semana">
+        <button class="icono" id="semana-anterior" aria-label="Semana anterior">‹</button>
+        <button class="enlace" id="semana-actual"><strong id="semana-titulo"></strong></button>
+        <button class="icono" id="semana-siguiente" aria-label="Semana siguiente">›</button>
+      </div>
+      <div id="lista-dias"></div>
+    </section>
+
+    <!-- ============ RECETAS ============ -->
+    <section id="vista-recetas" class="vista">
+      <input type="search" id="buscar-receta" class="buscador" placeholder="Buscar receta…">
+      <ul id="lista-recetas" class="lista"></ul>
+      <button class="fab" id="nueva-receta" aria-label="Nueva receta">+</button>
+    </section>
+
+    <!-- ============ DESPENSA ============ -->
+    <section id="vista-despensa" class="vista">
+      <input type="search" id="buscar-alimento" class="buscador" placeholder="Buscar alimento…">
+      <label class="interruptor"><input type="checkbox" id="solo-bajos"> Solo los que están por debajo del mínimo</label>
+      <div id="lista-despensa"></div>
+      <button class="fab" id="nuevo-alimento" aria-label="Nuevo alimento">+</button>
+    </section>
+
+    <!-- ============ COMPRA ============ -->
+    <section id="vista-compra" class="vista">
+      <div class="tarjeta rango">
+        <label>Menús desde <input type="date" id="compra-desde"></label>
+        <label>hasta <input type="date" id="compra-hasta"></label>
+      </div>
+      <div id="lista-compra"></div>
+      <div class="acciones-compra">
+        <button class="secundario" id="compartir-lista">Compartir</button>
+        <button class="primario" id="registrar-compra">Añadir marcados a la despensa</button>
+      </div>
+    </section>
+
+    <!-- ============ AJUSTES ============ -->
+    <section id="vista-ajustes" class="vista">
+      <article class="tarjeta">
+        <h2>Copia de seguridad</h2>
+        <p class="nota">Los datos se guardan solo en este dispositivo. Exporta de vez en cuando el fichero <code>.sqlite</code> para no perderlos.</p>
+        <div class="botones">
+          <button class="secundario" id="exportar">Exportar base de datos</button>
+          <label class="boton secundario">Importar…<input type="file" id="importar" accept=".sqlite,.db" hidden></label>
+        </div>
+      </article>
+
+      <article class="tarjeta">
+        <h2>Consola SQL</h2>
+        <p class="nota">Ejecuta SQL directamente sobre tu base de datos. Prueba con <code>SELECT * FROM v_despensa;</code></p>
+        <textarea id="consola-sql" rows="4" spellcheck="false" placeholder="SELECT name FROM sqlite_master WHERE type = 'table';"></textarea>
+        <button class="primario" id="ejecutar-sql">Ejecutar</button>
+        <div id="resultado-sql"></div>
+      </article>
+
+      <article class="tarjeta">
+        <h2>Zona peligrosa</h2>
+        <button class="peligro" id="borrar-todo">Borrar todos los datos</button>
+        <p class="nota" id="info-version"></p>
+      </article>
+    </section>
+  </main>
+
+  <nav class="pestanas">
+    <button data-vista="menu"><span aria-hidden="true">📅</span>Menú</button>
+    <button data-vista="recetas"><span aria-hidden="true">🍲</span>Recetas</button>
+    <button data-vista="despensa"><span aria-hidden="true">🥫</span>Despensa</button>
+    <button data-vista="compra"><span aria-hidden="true">🛒</span>Compra<b id="contador-compra" hidden></b></button>
+  </nav>
+
+
+  <!-- ============ DIÁLOGOS ============ -->
+
+  <dialog id="dlg-alimento">
+    <form>
+      <h2 id="alimento-titulo">Nuevo alimento</h2>
+      <input type="hidden" name="ident">
+      <label>Nombre <input name="nombre" required maxlength="60" autocomplete="off"></label>
+      <div class="dos-columnas">
+        <label>Categoría <select name="categoria"></select></label>
+        <label>Unidad <select name="unidad" required></select></label>
+      </div>
+      <div class="dos-columnas">
+        <label>En la despensa <input name="cantidad" type="number" min="0" step="any" inputmode="decimal" value="0" required></label>
+        <label>Stock mínimo <input name="minimo" type="number" min="0" step="any" inputmode="decimal" value="0" required></label>
+      </div>
+      <p class="nota">Si hay menos del stock mínimo, el alimento aparecerá en la lista de la compra aunque ningún menú lo necesite.</p>
+      <footer>
+        <button type="button" class="peligro" id="alimento-borrar">Borrar</button>
+        <span class="hueco"></span>
+        <button type="button" class="secundario" data-cerrar>Cancelar</button>
+        <button class="primario">Guardar</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="dlg-receta">
+    <form>
+      <h2 id="receta-titulo">Nueva receta</h2>
+      <input type="hidden" name="ident">
+      <div class="dos-columnas ancha-izq">
+        <label>Nombre <input name="nombre" required maxlength="80" autocomplete="off"></label>
+        <label>Raciones <input name="raciones" type="number" min="1" step="1" inputmode="numeric" required></label>
+      </div>
+      <h3>Ingredientes <small>(para esas raciones)</small></h3>
+      <ul id="lista-ingredientes" class="ingredientes"></ul>
+      <div class="botones">
+        <button type="button" class="enlace" id="anadir-ingrediente">+ Ingrediente</button>
+        <button type="button" class="enlace" id="crear-alimento">+ Crear alimento nuevo</button>
+      </div>
+      <label>Preparación <textarea name="instrucciones" rows="4"></textarea></label>
+      <footer>
+        <button type="button" class="peligro" id="receta-borrar">Borrar</button>
+        <span class="hueco"></span>
+        <button type="button" class="secundario" data-cerrar>Cancelar</button>
+        <button class="primario">Guardar</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="dlg-plato">
+    <form>
+      <h2 id="plato-titulo">Añadir plato</h2>
+      <input type="hidden" name="fecha">
+      <input type="hidden" name="momento">
+      <label>Receta <select name="receta" required></select></label>
+      <label>Raciones <input name="raciones" type="number" min="1" step="1" inputmode="numeric" required></label>
+      <footer>
+        <span class="hueco"></span>
+        <button type="button" class="secundario" data-cerrar>Cancelar</button>
+        <button class="primario">Añadir</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div id="aviso" class="aviso" role="status" aria-live="polite"></div>
+</body>
+</html>

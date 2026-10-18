@@ -1,0 +1,17 @@
+{
+  "name": "Menú Semanal",
+  "short_name": "Menú",
+  "description": "Planifica tus menús, controla la despensa y genera la lista de la compra.",
+  "lang": "es",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f6f4ef",
+  "theme_color": "#2f7d4f",
+  "icons": [
+    { "src": "icons/icono-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icono-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icono-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
