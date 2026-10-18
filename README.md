@@ -1,21 +1,23 @@
 # 🍽️ Menú Semanal
 
 Aplicación móvil para planificar menús, llevar el inventario de la despensa y generar
-automáticamente la lista de la compra.
+automáticamente la lista de la compra. **Varias personas comparten los mismos datos** en tiempo real.
 
-Es una **PWA** (Progressive Web App): HTML, CSS y JavaScript sin frameworks, con una base
-de datos **SQLite real** que funciona dentro del móvil. Se instala desde el navegador como
-cualquier app, funciona sin conexión y los datos no salen nunca del dispositivo.
+Es una **PWA** (Progressive Web App) hecha con HTML, CSS y JavaScript sin frameworks. Los datos
+viven en **PostgreSQL** (alojado en [Supabase](https://supabase.com)), protegidos con reglas de
+seguridad a nivel de fila.
+
+🔗 **App:** <https://mavtarq.github.io/MyMenuSemanal/>
 
 ## Funcionalidades
 
 | Pantalla | Qué hace |
 |---|---|
-| 📅 **Menú** | Semana de lunes a domingo con desayuno, comida y cena. Añades recetas con sus raciones. Al marcar un plato como *cocinado*, sus ingredientes se descuentan de la despensa. |
+| 📅 **Menú** | Semana de lunes a domingo con desayuno, comida y cena. Al marcar un plato como *cocinado*, sus ingredientes se descuentan de la despensa. |
 | 🍲 **Recetas** | Cada receta tiene sus raciones base y sus ingredientes con cantidades. |
-| 🥫 **Despensa** | Lo que tienes en casa, agrupado por categoría. Botones − / + para ajustar rápido y un *stock mínimo* opcional. |
-| 🛒 **Compra** | Lista calculada para un rango de fechas. La marcas mientras compras y, con un botón, todo lo marcado pasa a la despensa. Se puede compartir por WhatsApp, etc. |
-| ⚙️ **Ajustes** | Exportar o importar la base de datos (`.sqlite`), consola SQL y reinicio. |
+| 🥫 **Despensa** | Lo que hay en casa, por categorías. Botones − / + y un *stock mínimo* opcional. |
+| 🛒 **Compra** | Lista calculada para un rango de fechas. Lo que se marca en el súper aparece al momento en el móvil del otro, y con un botón pasa a la despensa. |
+| ⚙️ **Ajustes** | Código de invitación del hogar, miembros, copia de seguridad (JSON) e importación de la versión anterior (`.sqlite`). |
 
 ### Cómo se calcula la lista de la compra
 
@@ -27,31 +29,49 @@ a_comprar  = necesario + stock_mínimo − cantidad en la despensa      (si es >
 
 Las unidades enteras (`ud`, `paq`) se redondean hacia arriba.
 
-## Estructura del proyecto
+## Arquitectura
+
+```
+ Móvil A ─┐                       ┌──────────── Supabase ────────────┐
+          ├── HTTPS + sesión ───► │  Auth (correo y contraseña)      │
+ Móvil B ─┘   ◄── tiempo real ─── │  PostgreSQL + reglas RLS         │
+                                  │  Funciones SQL (lista_compra...) │
+   App estática en GitHub Pages   └──────────────────────────────────┘
+```
+
+- Cada familia es un **hogar**. Quien lo crea recibe un **código de invitación**, y el resto se une con él.
+- Las **reglas RLS** (Row Level Security) hacen que un usuario solo pueda leer y modificar filas de su hogar.
+  La protección está en la base de datos, no en la app: aunque alguien manipule el JavaScript, no puede ver datos ajenos.
+- Las operaciones de varios pasos (guardar una receta con sus ingredientes, cocinar, registrar la compra)
+  son **funciones SQL** que se ejecutan en una sola transacción.
+- **Sin conexión**: la app se abre y muestra los últimos datos consultados, pero para modificar hace falta conexión.
+
+### Estructura del proyecto
 
 ```
 ├── index.html               Pantallas y diálogos
 ├── css/estilos.css          Estilos (móvil primero, modo oscuro automático)
 ├── js/
 │   ├── app.js               Interfaz: pinta pantallas y responde a los toques
-│   ├── modelo.js            TODAS las consultas SQL de la app
-│   └── db.js                Conexión con SQLite, transacciones y guardado
-├── sql/
-│   ├── schema.sql           Tablas, relaciones, trigger y vista
-│   └── datos_iniciales.sql  Categorías, unidades y momentos del día
+│   ├── modelo.js            TODAS las operaciones con la base de datos
+│   ├── db.js                Conexión con Supabase, caché sin conexión y errores
+│   ├── config.js            URL y clave pública del proyecto Supabase
+│   └── migracion.js         Lee la base de datos SQLite de la versión anterior
+├── supabase/esquema.sql     Tablas, relaciones, reglas RLS y funciones (PostgreSQL)
 ├── sw.js                    Service worker (modo sin conexión)
 ├── manifest.webmanifest     Datos para instalar la app
-├── icons/                   Iconos (generados por código)
-├── herramientas/generar_iconos.py
-└── vendor/sql-wasm.*        SQLite compilado a WebAssembly (sql.js 1.10.3)
+├── icons/                   Iconos (generados con herramientas/generar_iconos.py)
+└── vendor/                  supabase-js 2.117.2 y sql.js 1.10.3 (solo para migrar)
 ```
-
-Las capas están separadas: `app.js` nunca escribe SQL, solo llama a funciones de `modelo.js`.
 
 ## Base de datos
 
 ```mermaid
 erDiagram
+    hogares    ||--o{ miembros : "tiene"
+    hogares    ||--o{ alimentos : "posee"
+    hogares    ||--o{ recetas : "posee"
+    hogares    ||--o{ menu : "planifica"
     categorias ||--o{ alimentos : agrupa
     unidades   ||--o{ alimentos : "se mide en"
     alimentos  ||--|| despensa : "stock (1:1)"
@@ -62,85 +82,51 @@ erDiagram
     alimentos  ||--o| compra_marcados : "en el carro"
 ```
 
-Conceptos de SQL que aparecen en el proyecto:
+Conceptos de SQL que aparecen en [`supabase/esquema.sql`](supabase/esquema.sql):
 
-- **Claves foráneas** con `ON DELETE CASCADE`, `SET NULL` y `RESTRICT` (no puedes borrar un alimento que se usa en una receta).
+- **Claves foráneas** con `ON DELETE CASCADE`, `SET NULL` y `RESTRICT`.
 - **Relación N:M** (`receta_ingredientes`) con clave primaria compuesta.
-- **Restricciones `CHECK`** (cantidades ≥ 0, fechas válidas).
+- **Índices únicos por expresión**: `(hogar_id, lower(nombre))`, para no repetir nombres dentro de un hogar.
+- **Row Level Security** con políticas por tabla.
+- **Funciones** `security invoker` (respetan RLS) y `security definer` (para crear hogares o unirse a uno).
 - **Trigger**: al crear un alimento se crea su fila en `despensa`.
-- **Vista** `v_despensa`, que une 4 tablas.
-- **CTE** (`WITH ...`) y agregación en la consulta de la lista de la compra.
-- **UPSERT** (`ON CONFLICT ... DO UPDATE`).
-- **Transacciones**: cada operación se aplica entera o no se aplica.
-- **Migraciones** con `PRAGMA user_version` (ver `prepararEsquema()` en `db.js`).
+- **Vistas** con `security_invoker`, **CTE**, agregación y `jsonb` (copias de seguridad).
 
-La consola SQL de *Ajustes* te deja hacer consultas sobre tus propios datos desde el móvil.
+## Puesta en marcha (una sola vez)
 
-### Dónde se guardan los datos
+1. **Esquema**: en Supabase, abre *SQL Editor* → *New query* → pega [`supabase/esquema.sql`](supabase/esquema.sql) → *Run*.
+   Puedes volver a ejecutarlo sin perder datos.
+2. **URL de la app**: en *Authentication* → *URL Configuration*:
+   - *Site URL*: `https://mavtarq.github.io/MyMenuSemanal/`
+   - *Redirect URLs*: añade esa misma URL y `http://localhost:8000/` (para pruebas en el ordenador).
 
-sql.js mantiene la base de datos en memoria. Después de cada cambio, `db.js` exporta el
-fichero `.sqlite` completo y lo guarda en **IndexedDB** (el almacenamiento del navegador).
-Si borras los datos del navegador o desinstalas la app, se pierden. Por eso conviene
-**exportar una copia de vez en cuando** desde Ajustes.
+   Sin esto, los enlaces de los correos de confirmación llevarían a una dirección que no existe.
+3. **Primer uso**: crea tu cuenta en la app, confirma el correo y crea un hogar. En *Ajustes* verás el código de
+   invitación para compartirlo.
 
 ## Ejecutarla en el ordenador
-
-El navegador no permite cargar `.wasm` ni `.sql` abriendo `index.html` con doble clic, así
-que hace falta un servidor local. Python ya trae uno:
 
 ```bash
 python -m http.server 8000
 ```
 
-Después abre <http://localhost:8000>. Activa la vista de móvil del navegador con `F12` → icono
-de móvil.
+Después abre <http://localhost:8000>. Usa la misma base de datos de Supabase que la versión publicada.
 
-> El service worker guarda la app en caché. Cuando cambies el código, recarga dos veces o
-> marca *Disable cache* en la pestaña *Network* de las herramientas de desarrollo.
+> El service worker guarda la app en caché. Cuando cambies el código, recarga dos veces o marca
+> *Disable cache* en la pestaña *Network* de las herramientas de desarrollo (F12).
 
-## Instalarla en el móvil
+## Publicar cambios
 
-Para instalarse, una PWA tiene que servirse por **HTTPS**. Lo más sencillo es GitHub Pages (gratis):
+1. Si añades o renombras ficheros, actualiza `ARCHIVOS` en `sw.js`.
+2. Sube la versión de `CACHE` en `sw.js` (`menu-semanal-v3`, …).
+3. `git commit` + `git push`. GitHub Pages se actualiza en uno o dos minutos, y los móviles cogen la versión nueva al abrir la app por segunda vez.
 
-1. Crea un repositorio en GitHub y sube esta carpeta:
-   ```bash
-   git init
-   git add .
-   git commit -m "Primera versión de Menú Semanal"
-   git branch -M main
-   git remote add origin https://github.com/TU_USUARIO/menu-semanal.git
-   git push -u origin main
-   ```
-2. En GitHub ve a **Settings → Pages → Branch: `main` / root → Save**.
-3. Al cabo de un minuto estará en `https://TU_USUARIO.github.io/menu-semanal/`.
-4. Ábrela en el móvil:
-   - **Android (Chrome)**: menú ⋮ → *Instalar aplicación*.
-   - **iPhone (Safari)**: botón compartir → *Añadir a pantalla de inicio*.
+Si cambias el esquema, añade los cambios a `supabase/esquema.sql` de forma que se puedan repetir
+(`create ... if not exists`, `alter table ... add column if not exists`, `create or replace function`)
+y vuelve a ejecutarlo en el SQL Editor.
 
-La app queda con su icono y funciona sin conexión. Tus datos se quedan en el móvil, no en GitHub.
+## Seguridad
 
-### Publicar cambios
-
-1. Si has añadido o renombrado ficheros, añádelos a `ARCHIVOS` en `sw.js`.
-2. Sube la versión en `sw.js`: `const CACHE = 'menu-semanal-v2';`
-3. `git commit` + `git push`. El móvil se actualiza la siguiente vez que abras la app con conexión.
-
-### Cambiar el esquema de la base de datos
-
-Las tablas usan `CREATE TABLE IF NOT EXISTS`, así que **modificar una tabla en `schema.sql` no
-cambia las bases de datos que ya existen**. Para eso:
-
-1. Sube `VERSION_ESQUEMA` en `db.js` (por ejemplo, a 2).
-2. Añade la migración en `prepararEsquema()`:
-   ```js
-   if (versionEsquema() < 2) db.exec('ALTER TABLE recetas ADD COLUMN tiempo_min INTEGER');
-   ```
-3. Pon también la columna en `schema.sql`, para que las instalaciones nuevas la tengan desde el principio.
-
-## Ideas para seguir
-
-- Editar categorías, unidades y momentos desde la app.
-- Copiar el menú de la semana anterior.
-- Caducidad de los alimentos (columna `caduca` en `despensa`).
-- Conversión entre unidades (g ↔ kg).
-- Fotos de las recetas (BLOB en SQLite).
+- `js/config.js` contiene la clave **publishable**, que está pensada para ser pública. **Nunca** pongas la clave *secret* / *service_role* en el código.
+- Sin sesión iniciada no se puede leer ni llamar a nada (se revocan los permisos de `anon`).
+- Las copias de seguridad `.json` / `.sqlite` contienen tus datos: `.gitignore` evita subirlas a GitHub.

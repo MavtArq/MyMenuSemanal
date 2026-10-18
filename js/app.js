@@ -4,6 +4,7 @@
 
 import * as db from './db.js';
 import * as m from './modelo.js';
+import { sqliteAJson, sqliteLocalAntiguo } from './migracion.js';
 
 
 // ---------- Utilidades ----------
@@ -16,9 +17,6 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g,
   c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
 const num = n => Number(n).toLocaleString('es-ES', { maximumFractionDigits: 2 });
-
-// Cantidades a comprar: enteras hacia arriba (3 huevos, no 2,5) o con 2 decimales
-const redondear = (n, entera) => entera ? Math.ceil(n - 1e-9) : Math.round(n * 100) / 100;
 
 const vacio = texto => `<p class="vacio">${texto}</p>`;
 
@@ -37,10 +35,10 @@ function aviso(texto, error = false) {
   el.classList.toggle('error', error);
   el.classList.add('visible');
   clearTimeout(aviso.temporizador);
-  aviso.temporizador = setTimeout(() => el.classList.remove('visible'), 3000);
+  aviso.temporizador = setTimeout(() => el.classList.remove('visible'), 3500);
 }
 
-// Ejecuta una acción y, si SQLite protesta, lo muestra en lenguaje humano
+// Ejecuta una acción y, si falla, muestra el error en lenguaje humano
 async function intentar(accion, mensajeOk) {
   try {
     await accion();
@@ -52,6 +50,14 @@ async function intentar(accion, mensajeOk) {
     return false;
   }
 }
+
+// Desactiva un botón mientras se espera al servidor (evita dobles toques)
+async function conBoton(boton, accion) {
+  boton.disabled = true;
+  try { return await accion(); } finally { boton.disabled = false; }
+}
+
+const urlApp = () => location.origin + location.pathname;
 
 
 // ---------- Fechas (siempre en hora local, formato AAAA-MM-DD) ----------
@@ -68,12 +74,16 @@ const fmtCorto = new Intl.DateTimeFormat('es-ES', { day: 'numeric', month: 'shor
 // ---------- Navegación entre pantallas ----------
 
 const estado = {
-  vista: 'menu',
+  vista: null,
+  usuario: null,
+  hogar: null,
   semana: lunesDe(new Date()),
   compra: [],
+  dejarDeEscuchar: null,
 };
 
 const TITULOS = {
+  acceso: 'Menú Semanal', hogar: 'Tu hogar',
   menu: 'Menú semanal', recetas: 'Recetas', despensa: 'Despensa',
   compra: 'Lista de la compra', ajustes: 'Ajustes',
 };
@@ -88,34 +98,143 @@ function mostrar(vista) {
   $$('.vista').forEach(v => v.classList.toggle('activa', v.id === `vista-${vista}`));
   $$('.pestanas button').forEach(b => b.classList.toggle('activa', b.dataset.vista === vista));
   $('#titulo').textContent = TITULOS[vista];
-  refrescar();
   window.scrollTo(0, 0);
+  return refrescar();
 }
 
-function refrescar() {
-  PINTAR[estado.vista]();
-  actualizarContadorCompra();
+async function refrescar() {
+  if (!estado.hogar || !PINTAR[estado.vista]) return;
+  try {
+    await Promise.all([PINTAR[estado.vista](), actualizarContadorCompra()]);
+  } catch (error) {
+    console.error(error);
+    aviso(db.mensajeError(error), true);
+  }
 }
 
-function actualizarContadorCompra() {
-  const n = m.listaCompra(iso(new Date()), iso(sumarDias(new Date(), 6))).length;
+async function actualizarContadorCompra() {
+  const n = (await m.listaCompra(iso(new Date()), iso(sumarDias(new Date(), 6)))).length;
   const el = $('#contador-compra');
   el.hidden = n === 0;
   el.textContent = n;
 }
+
+window.addEventListener('estado-conexion', e => { $('#sin-conexion').hidden = e.detail; });
+
+
+// ============================================================
+//  SESIÓN Y HOGAR
+// ============================================================
+
+async function alCambiarSesion(evento, sesion) {
+  if (evento === 'PASSWORD_RECOVERY') $('#dlg-password').showModal();
+  if (evento === 'TOKEN_REFRESHED' || evento === 'USER_UPDATED') return;
+
+  if (!sesion) {
+    salirDeLaApp();
+    return;
+  }
+  // Supabase repite SIGNED_IN al volver a la pestaña: si ya estamos dentro, no hacemos nada
+  if (estado.usuario?.id === sesion.user.id && estado.hogar) return;
+  estado.usuario = sesion.user;
+  await entrar();
+}
+
+async function entrar() {
+  $('#cargando')?.remove();
+  try {
+    estado.hogar = await m.miHogar();
+  } catch (error) {
+    aviso(db.mensajeError(error), true);
+    return;
+  }
+  document.body.dataset.sesion = estado.hogar ? 'si' : 'no';
+
+  if (!estado.hogar) {
+    $('#hogar-email').textContent = estado.usuario.email;
+    mostrar('hogar');
+    return;
+  }
+
+  // Cuando la otra persona cambia algo, se repinta la pantalla (agrupando cambios seguidos)
+  estado.dejarDeEscuchar?.();
+  let temporizador;
+  estado.dejarDeEscuchar = m.escucharCambios(() => {
+    clearTimeout(temporizador);
+    temporizador = setTimeout(refrescar, 400);
+  });
+
+  await mostrar(PINTAR[estado.vista] ? estado.vista : 'menu');
+  ofrecerMigracion();
+}
+
+function salirDeLaApp() {
+  estado.dejarDeEscuchar?.();
+  estado.dejarDeEscuchar = null;
+  estado.usuario = null;
+  estado.hogar = null;
+  db.borrarCache();
+  document.body.dataset.sesion = 'no';
+  $('#cargando')?.remove();
+  mostrar('acceso');
+}
+
+$('#form-acceso').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = e.target.elements;
+  const credenciales = { email: f.email.value.trim(), password: f.password.value };
+  const registro = e.submitter?.value === 'registro';
+  await conBoton(e.submitter, () => intentar(async () => {
+    if (registro) {
+      const respuesta = await db.datos(db.cliente.auth.signUp({ ...credenciales, options: { emailRedirectTo: urlApp() } }));
+      if (!respuesta.session) aviso('Te hemos enviado un correo. Ábrelo y pulsa el enlace para confirmar la cuenta.');
+    } else {
+      await db.datos(db.cliente.auth.signInWithPassword(credenciales));
+    }
+  }));
+});
+
+$('#olvide-password').addEventListener('click', async () => {
+  const email = $('#form-acceso').elements.email.value.trim();
+  if (!email) { aviso('Escribe primero tu correo', true); return; }
+  await intentar(() => db.datos(db.cliente.auth.resetPasswordForEmail(email, { redirectTo: urlApp() })),
+    'Te hemos enviado un correo para cambiar la contraseña');
+});
+
+$('#dlg-password form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const ok = await intentar(() => db.datos(db.cliente.auth.updateUser({ password: e.target.elements.password.value })),
+    'Contraseña cambiada');
+  if (ok) $('#dlg-password').close();
+});
+
+$('#form-crear-hogar').addEventListener('submit', async e => {
+  e.preventDefault();
+  const ok = await conBoton(e.submitter, () => intentar(() => m.crearHogar(e.target.elements.nombre.value.trim()), 'Hogar creado'));
+  if (ok) await entrar();
+});
+
+$('#form-unirse').addEventListener('submit', async e => {
+  e.preventDefault();
+  const ok = await conBoton(e.submitter, () => intentar(() => m.unirseHogar(e.target.elements.codigo.value.trim()), 'Te has unido al hogar'));
+  if (ok) await entrar();
+});
+
+$$('[data-cerrar-sesion]').forEach(b => b.addEventListener('click', async () => {
+  await db.cliente.auth.signOut({ scope: 'local' });
+}));
 
 
 // ============================================================
 //  MENÚ SEMANAL
 // ============================================================
 
-function pintarMenu() {
+async function pintarMenu() {
   const inicio = estado.semana;
   const fin = sumarDias(inicio, 6);
   $('#semana-titulo').textContent = `${fmtCorto.format(inicio)} – ${fmtCorto.format(fin)}`;
 
-  const platos = m.menuEntre(iso(inicio), iso(fin));
-  const momentos = m.momentos();
+  const [platos, momentos] = await Promise.all([m.menuEntre(iso(inicio), iso(fin)), m.momentos()]);
   const hoy = iso(new Date());
 
   let html = '';
@@ -141,15 +260,15 @@ function pintarMenu() {
   $('#lista-dias').innerHTML = html;
 }
 
-$('#semana-anterior').addEventListener('click', () => { estado.semana = sumarDias(estado.semana, -7); pintarMenu(); });
-$('#semana-siguiente').addEventListener('click', () => { estado.semana = sumarDias(estado.semana, 7); pintarMenu(); });
-$('#semana-actual').addEventListener('click', () => { estado.semana = lunesDe(new Date()); pintarMenu(); });
+$('#semana-anterior').addEventListener('click', () => { estado.semana = sumarDias(estado.semana, -7); refrescar(); });
+$('#semana-siguiente').addEventListener('click', () => { estado.semana = sumarDias(estado.semana, 7); refrescar(); });
+$('#semana-actual').addEventListener('click', () => { estado.semana = lunesDe(new Date()); refrescar(); });
 
 $('#lista-dias').addEventListener('click', async e => {
   const boton = e.target.closest('button');
   if (!boton) return;
   if (boton.dataset.quitar) {
-    await intentar(() => m.quitarDelMenu(Number(boton.dataset.quitar)));
+    await conBoton(boton, () => intentar(() => m.quitarDelMenu(Number(boton.dataset.quitar))));
     refrescar();
   } else if (boton.dataset.anadir) {
     const [fecha, momento] = boton.dataset.anadir.split('|');
@@ -161,28 +280,28 @@ $('#lista-dias').addEventListener('change', async e => {
   const id = e.target.dataset.cocinar;
   if (!id) return;
   const cocinado = e.target.checked;
+  e.target.disabled = true;
   await intentar(() => m.marcarCocinado(Number(id), cocinado),
     cocinado ? 'Ingredientes descontados de la despensa' : 'Ingredientes devueltos a la despensa');
   refrescar();
 });
 
-function abrirPlato(fecha, momentoId) {
-  const recetas = m.recetas();
+async function abrirPlato(fecha, momentoId) {
+  const [recetas, momentos] = await Promise.all([m.recetas(), m.momentos()]);
   if (!recetas.length) {
     aviso('Primero crea alguna receta');
     mostrar('recetas');
     return;
   }
-  const dlg = $('#dlg-plato');
-  const f = dlg.querySelector('form');
-  const momento = m.momentos().find(x => x.id === momentoId);
+  const f = $('#dlg-plato form');
+  const momento = momentos.find(x => x.id === momentoId);
   $('#plato-titulo').textContent = `${momento.nombre} · ${fmtDia.format(desdeIso(fecha))}`;
   f.elements.receta.innerHTML = recetas
     .map(r => `<option value="${r.id}" data-raciones="${r.raciones}">${esc(r.nombre)}</option>`).join('');
   f.elements.raciones.value = recetas[0].raciones;
   f.elements.fecha.value = fecha;
   f.elements.momento.value = momentoId;
-  dlg.showModal();
+  $('#dlg-plato').showModal();
 }
 
 $('#dlg-plato form').elements.receta.addEventListener('change', e => {
@@ -192,13 +311,13 @@ $('#dlg-plato form').elements.receta.addEventListener('change', e => {
 $('#dlg-plato form').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target.elements;
-  const ok = await intentar(() => m.planificar({
+  const ok = await conBoton(e.submitter, () => intentar(() => m.planificar({
     fecha: f.fecha.value,
     momento_id: Number(f.momento.value),
     receta_id: Number(f.receta.value),
     raciones: Number(f.raciones.value),
-  }));
-  if (ok) { e.target.closest('dialog').close(); refrescar(); }
+  })));
+  if (ok) { $('#dlg-plato').close(); refrescar(); }
 });
 
 
@@ -206,9 +325,9 @@ $('#dlg-plato form').addEventListener('submit', async e => {
 //  RECETAS
 // ============================================================
 
-function pintarRecetas() {
+async function pintarRecetas() {
   const filtro = $('#buscar-receta').value.trim().toLowerCase();
-  const lista = m.recetas().filter(r => r.nombre.toLowerCase().includes(filtro));
+  const lista = (await m.recetas()).filter(r => r.nombre.toLowerCase().includes(filtro));
   $('#lista-recetas').innerHTML = lista.length
     ? lista.map(r => `
         <li><button class="fila" data-receta="${r.id}">
@@ -243,9 +362,17 @@ function filaIngrediente(ing = {}) {
   return li;
 }
 
-function abrirReceta(id) {
-  alimentosReceta = m.despensa();
-  const r = id ? m.receta(id) : { nombre: '', raciones: 2, instrucciones: '', ingredientes: [] };
+async function abrirReceta(id) {
+  let r;
+  try {
+    [alimentosReceta, r] = await Promise.all([
+      m.despensa(),
+      id ? m.receta(id) : { nombre: '', raciones: 2, instrucciones: '', ingredientes: [] },
+    ]);
+  } catch (error) {
+    aviso(db.mensajeError(error), true);
+    return;
+  }
   const f = $('#dlg-receta form');
   f.reset();
   f.elements.ident.value = r.id ?? '';
@@ -267,8 +394,8 @@ $('#lista-ingredientes').addEventListener('click', e => {
 });
 
 // Crear un alimento sin salir de la receta: al guardarlo queda elegido en una fila
-$('#crear-alimento').addEventListener('click', () => abrirAlimento(null, nuevoId => {
-  alimentosReceta = m.despensa();
+$('#crear-alimento').addEventListener('click', () => abrirAlimento(null, async nuevoId => {
+  alimentosReceta = await m.despensa();
   for (const select of $$('#lista-ingredientes select')) {
     const elegido = Number(select.value) || null;
     select.innerHTML = opcionesAlimentos(elegido);
@@ -289,13 +416,13 @@ $('#dlg-receta form').addEventListener('submit', async e => {
     if (!(cantidad > 0)) { aviso('Indica la cantidad de cada ingrediente', true); return; }
     ingredientes.push({ alimento_id, cantidad });
   }
-  const ok = await intentar(() => m.guardarReceta({
+  const ok = await conBoton(e.submitter, () => intentar(() => m.guardarReceta({
     id: Number(f.ident.value) || null,
     nombre: f.nombre.value.trim(),
     raciones: Number(f.raciones.value),
     instrucciones: f.instrucciones.value.trim() || null,
     ingredientes,
-  }), 'Receta guardada');
+  }), 'Receta guardada'));
   if (ok) { $('#dlg-receta').close(); refrescar(); }
 });
 
@@ -311,10 +438,10 @@ $('#receta-borrar').addEventListener('click', async () => {
 //  DESPENSA
 // ============================================================
 
-function pintarDespensa() {
+async function pintarDespensa() {
   const filtro = $('#buscar-alimento').value.trim().toLowerCase();
   const soloBajos = $('#solo-bajos').checked;
-  const lista = m.despensa()
+  const lista = (await m.despensa())
     .filter(a => a.nombre.toLowerCase().includes(filtro))
     .filter(a => !soloBajos || a.bajo_minimo);
 
@@ -354,23 +481,29 @@ $('#lista-despensa').addEventListener('click', async e => {
   if (!boton) return;
   if (boton.dataset.editar) abrirAlimento(Number(boton.dataset.editar));
   if (boton.dataset.ajustar) {
-    await intentar(() => m.ajustarStock(Number(boton.dataset.ajustar), Number(boton.dataset.delta)));
+    await conBoton(boton, () => intentar(() => m.ajustarStock(Number(boton.dataset.ajustar), Number(boton.dataset.delta))));
     refrescar();
   }
 });
 
 let alGuardarAlimento = null;   // callback opcional (lo usa el diálogo de recetas)
 
-function abrirAlimento(id, alGuardar = null) {
+async function abrirAlimento(id, alGuardar = null) {
   alGuardarAlimento = alGuardar;
+  let categorias, unidades, a;
+  try {
+    [categorias, unidades, a] = await Promise.all([m.categorias(), m.unidades(), id ? m.alimento(id) : null]);
+  } catch (error) {
+    aviso(db.mensajeError(error), true);
+    return;
+  }
   const f = $('#dlg-alimento form');
   f.reset();
   f.elements.categoria.innerHTML = '<option value="">Sin categoría</option>' +
-    m.categorias().map(c => `<option value="${c.id}">${esc(c.nombre)}</option>`).join('');
+    categorias.map(c => `<option value="${c.id}">${esc(c.nombre)}</option>`).join('');
   f.elements.unidad.innerHTML =
-    m.unidades().map(u => `<option value="${u.id}">${esc(u.nombre)} (${esc(u.abreviatura)})</option>`).join('');
+    unidades.map(u => `<option value="${u.id}">${esc(u.nombre)} (${esc(u.abreviatura)})</option>`).join('');
 
-  const a = id ? m.alimento(id) : null;
   f.elements.ident.value = a?.id ?? '';
   f.elements.nombre.value = a?.nombre ?? '';
   f.elements.categoria.value = a?.categoria_id ?? '';
@@ -386,7 +519,7 @@ $('#dlg-alimento form').addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target.elements;
   let id;
-  const ok = await intentar(async () => {
+  const ok = await conBoton(e.submitter, () => intentar(async () => {
     id = await m.guardarAlimento({
       id: Number(f.ident.value) || null,
       nombre: f.nombre.value.trim(),
@@ -395,10 +528,10 @@ $('#dlg-alimento form').addEventListener('submit', async e => {
       cantidad: Number(f.cantidad.value),
       stock_minimo: Number(f.minimo.value),
     });
-  }, 'Alimento guardado');
+  }, 'Alimento guardado'));
   if (!ok) return;
   $('#dlg-alimento').close();
-  alGuardarAlimento?.(id);
+  await alGuardarAlimento?.(id);
   refrescar();
 });
 
@@ -414,10 +547,10 @@ $('#alimento-borrar').addEventListener('click', async () => {
 //  LISTA DE LA COMPRA
 // ============================================================
 
-function pintarCompra() {
+async function pintarCompra() {
   const desde = $('#compra-desde').value;
   const hasta = $('#compra-hasta').value;
-  estado.compra = m.listaCompra(desde, hasta).map(i => ({ ...i, cantidad: redondear(i.a_comprar, i.entera) }));
+  estado.compra = await m.listaCompra(desde, hasta);
 
   const marcados = estado.compra.filter(i => i.marcado).length;
   $('#registrar-compra').disabled = marcados === 0;
@@ -452,86 +585,136 @@ function pintarCompra() {
   $('#lista-compra').innerHTML = html;
 }
 
-$('#compra-desde').addEventListener('change', pintarCompra);
-$('#compra-hasta').addEventListener('change', pintarCompra);
+$('#compra-desde').addEventListener('change', refrescar);
+$('#compra-hasta').addEventListener('change', refrescar);
 
 $('#lista-compra').addEventListener('change', async e => {
   const id = e.target.dataset.marcar;
   if (!id) return;
+  e.target.closest('li').classList.toggle('marcado', e.target.checked);   // respuesta inmediata
   await intentar(() => m.marcarEnCarro(Number(id), e.target.checked));
-  pintarCompra();
+  refrescar();
 });
 
-$('#registrar-compra').addEventListener('click', async () => {
-  const comprados = estado.compra.filter(i => i.marcado);
-  await intentar(() => m.registrarCompra(comprados), `${comprados.length} alimentos añadidos a la despensa`);
+$('#registrar-compra').addEventListener('click', async e => {
+  await conBoton(e.currentTarget, () => intentar(async () => {
+    const n = await m.registrarCompra($('#compra-desde').value, $('#compra-hasta').value);
+    aviso(`${n} alimentos añadidos a la despensa`);
+  }));
   refrescar();
 });
 
 $('#compartir-lista').addEventListener('click', async () => {
   const texto = '🛒 Lista de la compra\n' + estado.compra
     .map(i => `${i.marcado ? '✔' : '•'} ${i.nombre}: ${num(i.cantidad)} ${i.unidad}`).join('\n');
-  try {
-    if (navigator.share) await navigator.share({ title: 'Lista de la compra', text: texto });
-    else { await navigator.clipboard.writeText(texto); aviso('Lista copiada al portapapeles'); }
-  } catch (error) {
-    if (error.name !== 'AbortError') aviso('No se pudo compartir la lista', true);
-  }
+  await compartir('Lista de la compra', texto, 'Lista copiada al portapapeles');
 });
+
+async function compartir(titulo, texto, mensajeCopiado) {
+  try {
+    if (navigator.share) await navigator.share({ title: titulo, text: texto });
+    else { await navigator.clipboard.writeText(texto); aviso(mensajeCopiado); }
+  } catch (error) {
+    if (error.name !== 'AbortError') aviso('No se pudo compartir', true);
+  }
+}
 
 
 // ============================================================
 //  AJUSTES
 // ============================================================
 
-function pintarAjustes() {
-  $('#info-version').textContent = `Versión del esquema de la base de datos: ${db.versionEsquema()}`;
+async function pintarAjustes() {
+  const miembros = await m.miembros();
+  $('#ajustes-hogar').textContent = `Hogar: ${estado.hogar.nombre}`;
+  $('#ajustes-codigo').textContent = estado.hogar.codigo_invitacion;
+  $('#ajustes-email').textContent = estado.usuario.email;
+  $('#ajustes-miembros').innerHTML = miembros
+    .map(x => `<li>${esc(x.email ?? 'Sin correo')}${x.user_id === estado.usuario.id ? ' <small>(tú)</small>' : ''}</li>`).join('');
+  $('#migrar-local').hidden = !(await sqliteLocalAntiguo());
 }
 
 $('#btn-ajustes').addEventListener('click', () => mostrar(estado.vista === 'ajustes' ? 'menu' : 'ajustes'));
 
-$('#exportar').addEventListener('click', () => {
-  const blob = new Blob([db.exportar()], { type: 'application/x-sqlite3' });
-  const enlace = document.createElement('a');
-  enlace.href = URL.createObjectURL(blob);
-  enlace.download = `menu-semanal-${iso(new Date())}.sqlite`;
-  enlace.click();
-  setTimeout(() => URL.revokeObjectURL(enlace.href), 1000);
+$('#compartir-codigo').addEventListener('click', () => compartir('Menú Semanal',
+  `Únete a nuestro hogar en Menú Semanal: ${urlApp()}\nCrea una cuenta y usa el código ${estado.hogar.codigo_invitacion}`,
+  'Invitación copiada al portapapeles'));
+
+$('#regenerar-codigo').addEventListener('click', async () => {
+  if (!confirm('El código actual dejará de funcionar. ¿Crear uno nuevo?')) return;
+  await intentar(async () => {
+    estado.hogar.codigo_invitacion = await m.regenerarCodigo();
+  }, 'Código cambiado');
+  refrescar();
 });
+
+$('#salir-hogar').addEventListener('click', async () => {
+  const miembros = await m.miembros();
+  const ultimo = miembros.length <= 1;
+  const pregunta = ultimo
+    ? 'Eres el único miembro: al salir se BORRARÁN todos los datos del hogar. ¿Seguro?'
+    : 'Dejarás de ver los datos de este hogar (los demás miembros los conservan). ¿Salir?';
+  if (!confirm(pregunta)) return;
+  const ok = await intentar(() => m.salirHogar(), 'Has salido del hogar');
+  if (!ok) return;
+  estado.dejarDeEscuchar?.();
+  estado.hogar = null;
+  db.borrarCache();
+  await entrar();
+});
+
+$('#exportar').addEventListener('click', async e => {
+  await conBoton(e.currentTarget, () => intentar(async () => {
+    const copia = await m.exportarDatos();
+    const blob = new Blob([JSON.stringify(copia, null, 2)], { type: 'application/json' });
+    const enlace = document.createElement('a');
+    enlace.href = URL.createObjectURL(blob);
+    enlace.download = `menu-semanal-${iso(new Date())}.json`;
+    enlace.click();
+    setTimeout(() => URL.revokeObjectURL(enlace.href), 1000);
+  }));
+});
+
+async function importar(obtenerCopia) {
+  await intentar(async () => {
+    const r = await m.importarDatos(await obtenerCopia());
+    aviso(`Importados: ${r.alimentos} alimentos, ${r.recetas} recetas y ${r.menu} platos del menú`);
+  });
+  refrescar();
+}
 
 $('#importar').addEventListener('change', async e => {
   const fichero = e.target.files[0];
   e.target.value = '';
-  if (!fichero || !confirm('Se sustituirán TODOS los datos actuales por los del fichero. ¿Continuar?')) return;
-  const bytes = new Uint8Array(await fichero.arrayBuffer());
-  await intentar(() => db.importar(bytes), 'Copia de seguridad restaurada');
-  refrescar();
+  if (!fichero) return;
+  await importar(async () => {
+    if (fichero.name.toLowerCase().endsWith('.json')) return JSON.parse(await fichero.text());
+    return sqliteAJson(new Uint8Array(await fichero.arrayBuffer()));
+  });
 });
 
-$('#ejecutar-sql').addEventListener('click', async () => {
-  const sql = $('#consola-sql').value.trim();
-  if (!sql) return;
-  const salida = $('#resultado-sql');
+$('#migrar-local').addEventListener('click', async () => {
+  await importar(async () => sqliteAJson(await sqliteLocalAntiguo()));
+  try { localStorage.setItem('migracion-local', 'hecha'); } catch { /* sin almacenamiento */ }
+});
+
+// La primera vez, si este móvil tiene datos de la versión anterior, ofrece subirlos
+async function ofrecerMigracion() {
   try {
-    const { resultados, cambios } = await db.consultaLibre(sql);
-    salida.innerHTML = resultados.map(({ columns, values }) => `
-      <div class="tabla-sql"><table>
-        <thead><tr>${columns.map(c => `<th>${esc(c)}</th>`).join('')}</tr></thead>
-        <tbody>${values.map(fila => `<tr>${fila.map(v => `<td>${v === null ? '<i>NULL</i>' : esc(v)}</td>`).join('')}</tr>`).join('')}</tbody>
-      </table></div>
-      <p class="nota">${values.length} filas</p>`).join('')
-      || `<p class="nota">Hecho. Filas modificadas: ${cambios}</p>`;
+    if (localStorage.getItem('migracion-local')) return;
+    const bytes = await sqliteLocalAntiguo();
+    if (!bytes) return;
+    localStorage.setItem('migracion-local', 'ofrecida');
+    if (!confirm('Este móvil tiene datos de la versión anterior de la app. ¿Subirlos a vuestro hogar compartido?\n\n(Si ya existen alimentos o recetas con el mismo nombre, no se duplican.)')) {
+      aviso('Puedes subirlos más tarde desde Ajustes');
+      return;
+    }
+    await importar(async () => sqliteAJson(bytes));
+    localStorage.setItem('migracion-local', 'hecha');
   } catch (error) {
-    salida.innerHTML = `<p class="error-sql">${esc(error.message)}</p>`;
+    console.warn('Migración no disponible:', error);
   }
-});
-
-$('#borrar-todo').addEventListener('click', async () => {
-  if (!confirm('Se borrarán todos los alimentos, recetas y menús. ¿Seguro?')) return;
-  if (!confirm('Última oportunidad: esta acción no se puede deshacer.')) return;
-  await intentar(() => db.reiniciar(), 'Datos borrados');
-  mostrar('menu');
-});
+}
 
 
 // ============================================================
@@ -543,26 +726,23 @@ $$('[data-cerrar]').forEach(b => b.addEventListener('click', () => b.closest('di
 
 $$('.pestanas button').forEach(b => b.addEventListener('click', () => mostrar(b.dataset.vista)));
 
-async function iniciar() {
-  try {
-    await db.abrir();
-  } catch (error) {
-    console.error(error);
-    $('#cargando').textContent = `No se pudo abrir la base de datos: ${error.message}`;
-    return;
-  }
-  $('#cargando').remove();
-  $('#compra-desde').value = iso(new Date());
-  $('#compra-hasta').value = iso(sumarDias(new Date(), 6));
-  mostrar('menu');
+// Al volver a la app, se recargan los datos por si hubo cambios mientras estaba en segundo plano
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refrescar(); });
+window.addEventListener('online', refrescar);
 
-  // Pide al navegador que no borre los datos aunque falte espacio
-  navigator.storage?.persist?.();
+$('#compra-desde').value = iso(new Date());
+$('#compra-hasta').value = iso(sumarDias(new Date(), 6));
 
-  // Service worker: permite instalar la app y usarla sin conexión
-  if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(error => console.warn('Sin modo offline:', error));
-  }
+// Supabase avisa del estado de la sesión al arrancar (INITIAL_SESSION) y en cada cambio.
+// La llamada se aplaza para no hacer peticiones dentro del propio aviso (recomendación de Supabase).
+db.cliente.auth.onAuthStateChange((evento, sesion) => {
+  setTimeout(() => alCambiarSesion(evento, sesion), 0);
+});
+
+// Pide al navegador que no borre los datos guardados aunque falte espacio
+navigator.storage?.persist?.();
+
+// Service worker: permite instalar la app y abrirla sin conexión
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(error => console.warn('Sin modo offline:', error));
 }
-
-iniciar();

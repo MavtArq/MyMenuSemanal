@@ -10,7 +10,7 @@
 //  versión de CACHE.
 // ============================================================
 
-const CACHE = 'menu-semanal-v1';
+const CACHE = 'menu-semanal-v2';
 
 const ARCHIVOS = [
   './',
@@ -18,10 +18,11 @@ const ARCHIVOS = [
   'manifest.webmanifest',
   'css/estilos.css',
   'js/app.js',
+  'js/config.js',
   'js/db.js',
   'js/modelo.js',
-  'sql/schema.sql',
-  'sql/datos_iniciales.sql',
+  'js/migracion.js',
+  'vendor/supabase.js',
   'vendor/sql-wasm.js',
   'vendor/sql-wasm.wasm',
   'icons/icono-192.png',
@@ -42,7 +43,8 @@ self.addEventListener('activate', evento => {
 });
 
 self.addEventListener('fetch', evento => {
-  if (evento.request.method !== 'GET') return;
+  // Solo los ficheros de la propia app. Las peticiones a Supabase (datos y sesión) van siempre a la red.
+  if (evento.request.method !== 'GET' || new URL(evento.request.url).origin !== self.location.origin) return;
   evento.respondWith(
     caches.open(CACHE).then(async cache => {
       const enCache = await cache.match(evento.request, { ignoreSearch: true });

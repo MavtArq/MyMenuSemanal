@@ -10,18 +10,52 @@
   <link rel="icon" href="icons/icono-192.png">
   <link rel="apple-touch-icon" href="icons/icono-192.png">
   <link rel="stylesheet" href="css/estilos.css">
-  <script src="vendor/sql-wasm.js"></script>
+  <script src="vendor/supabase.js"></script>
   <script type="module" src="js/app.js"></script>
 </head>
-<body>
+<body data-sesion="no">
 
   <header class="barra">
-    <h1 id="titulo">Menú semanal</h1>
+    <h1 id="titulo">Menú Semanal</h1>
     <button id="btn-ajustes" class="icono" aria-label="Ajustes">⚙️</button>
   </header>
+  <div id="sin-conexion" class="banda" hidden>Sin conexión · mostrando los últimos datos guardados</div>
 
   <main>
-    <p id="cargando" class="vacio">Cargando base de datos…</p>
+    <p id="cargando" class="vacio">Conectando…</p>
+
+    <!-- ============ ACCESO ============ -->
+    <section id="vista-acceso" class="vista">
+      <div class="bienvenida">
+        <img src="icons/icono-192.png" alt="" width="88" height="88">
+        <h2>Menú Semanal</h2>
+        <p class="nota">Planificad juntos los menús, la despensa y la compra.</p>
+      </div>
+      <form id="form-acceso" class="tarjeta formulario">
+        <label>Correo <input type="email" name="email" required autocomplete="email"></label>
+        <label>Contraseña <input type="password" name="password" required minlength="6" autocomplete="current-password"></label>
+        <button class="primario" value="entrar">Entrar</button>
+        <button class="secundario" value="registro">Crear cuenta nueva</button>
+        <button type="button" class="enlace" id="olvide-password">He olvidado mi contraseña</button>
+      </form>
+    </section>
+
+    <!-- ============ HOGAR (primer acceso) ============ -->
+    <section id="vista-hogar" class="vista">
+      <p class="nota">Hola, <strong id="hogar-email"></strong>. Los datos se comparten por <strong>hogar</strong>:
+        crea uno nuevo o únete al de tu pareja con su código de invitación.</p>
+      <form id="form-crear-hogar" class="tarjeta formulario">
+        <h2>Crear un hogar</h2>
+        <label>Nombre <input name="nombre" required maxlength="60" placeholder="Nuestra casa"></label>
+        <button class="primario">Crear hogar</button>
+      </form>
+      <form id="form-unirse" class="tarjeta formulario">
+        <h2>Unirme a un hogar</h2>
+        <label>Código de invitación <input name="codigo" required minlength="8" maxlength="8" autocomplete="off" autocapitalize="characters" placeholder="A1B2C3D4"></label>
+        <button class="primario">Unirme</button>
+      </form>
+      <button class="enlace" data-cerrar-sesion>Cerrar sesión</button>
+    </section>
 
     <!-- ============ MENÚ ============ -->
     <section id="vista-menu" class="vista">
@@ -64,26 +98,35 @@
     <!-- ============ AJUSTES ============ -->
     <section id="vista-ajustes" class="vista">
       <article class="tarjeta">
+        <h2 id="ajustes-hogar">Hogar</h2>
+        <p class="nota">Comparte este código con quien quieras que vea y edite los mismos datos:</p>
+        <div class="codigo">
+          <strong id="ajustes-codigo"></strong>
+          <button class="secundario" id="compartir-codigo">Compartir</button>
+        </div>
+        <h3>Miembros</h3>
+        <ul id="ajustes-miembros" class="lista-simple"></ul>
+        <button class="enlace peque" id="regenerar-codigo">Cambiar el código (el anterior dejará de servir)</button>
+      </article>
+
+      <article class="tarjeta">
         <h2>Copia de seguridad</h2>
-        <p class="nota">Los datos se guardan solo en este dispositivo. Exporta de vez en cuando el fichero <code>.sqlite</code> para no perderlos.</p>
+        <p class="nota">Los datos se guardan en la nube (Supabase). Puedes descargar una copia en JSON, o importar
+          una copia o la base de datos <code>.sqlite</code> de la versión anterior de la app.</p>
         <div class="botones">
-          <button class="secundario" id="exportar">Exportar base de datos</button>
-          <label class="boton secundario">Importar…<input type="file" id="importar" accept=".sqlite,.db" hidden></label>
+          <button class="secundario" id="exportar">Descargar copia</button>
+          <label class="boton secundario">Importar…<input type="file" id="importar" accept=".json,.sqlite,.db" hidden></label>
+          <button class="secundario" id="migrar-local" hidden>Subir datos de la versión anterior</button>
         </div>
       </article>
 
       <article class="tarjeta">
-        <h2>Consola SQL</h2>
-        <p class="nota">Ejecuta SQL directamente sobre tu base de datos. Prueba con <code>SELECT * FROM v_despensa;</code></p>
-        <textarea id="consola-sql" rows="4" spellcheck="false" placeholder="SELECT name FROM sqlite_master WHERE type = 'table';"></textarea>
-        <button class="primario" id="ejecutar-sql">Ejecutar</button>
-        <div id="resultado-sql"></div>
-      </article>
-
-      <article class="tarjeta">
-        <h2>Zona peligrosa</h2>
-        <button class="peligro" id="borrar-todo">Borrar todos los datos</button>
-        <p class="nota" id="info-version"></p>
+        <h2>Cuenta</h2>
+        <p class="nota">Sesión iniciada como <strong id="ajustes-email"></strong></p>
+        <div class="botones">
+          <button class="secundario" data-cerrar-sesion>Cerrar sesión</button>
+          <button class="peligro" id="salir-hogar">Salir del hogar</button>
+        </div>
       </article>
     </section>
   </main>
@@ -156,6 +199,17 @@
         <span class="hueco"></span>
         <button type="button" class="secundario" data-cerrar>Cancelar</button>
         <button class="primario">Añadir</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="dlg-password">
+    <form>
+      <h2>Nueva contraseña</h2>
+      <label>Contraseña <input type="password" name="password" required minlength="6" autocomplete="new-password"></label>
+      <footer>
+        <span class="hueco"></span>
+        <button class="primario">Guardar</button>
       </footer>
     </form>
   </dialog>

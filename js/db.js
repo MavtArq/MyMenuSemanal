@@ -1,174 +1,86 @@
 // ============================================================
-//  db.js · Conexión con SQLite y persistencia en el móvil
+//  db.js · Conexión con Supabase (PostgreSQL en la nube)
 //
-//  sql.js es SQLite compilado a WebAssembly. La base de datos se
-//  trabaja en memoria y, tras cada cambio, el fichero .sqlite
-//  completo se guarda en IndexedDB (el almacén del navegador).
+//  Además guarda en el móvil una copia de cada consulta para
+//  poder ver los últimos datos cuando no hay conexión.
 // ============================================================
 
-const VERSION_ESQUEMA = 1;
+import { SUPABASE_URL, SUPABASE_CLAVE } from './config.js';
 
-let SQL = null;   // la librería sql.js
-let db = null;    // la base de datos abierta
+export const cliente = supabase.createClient(SUPABASE_URL, SUPABASE_CLAVE, {
+  auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+});
 
-
-// ---------- IndexedDB: dónde se guarda el fichero .sqlite ----------
-
-function abrirIDB() {
-  return new Promise((resolve, reject) => {
-    const peticion = indexedDB.open('menu-semanal', 1);
-    peticion.onupgradeneeded = () => peticion.result.createObjectStore('ficheros');
-    peticion.onsuccess = () => resolve(peticion.result);
-    peticion.onerror = () => reject(peticion.error);
-  });
+/** Convierte la respuesta { data, error } de Supabase en datos, o lanza el error */
+export async function datos(peticion) {
+  const { data, error } = await peticion;
+  if (error) throw error;
+  return data;
 }
 
-async function idb(modo, accion) {
-  const conexion = await abrirIDB();
-  return new Promise((resolve, reject) => {
-    const tx = conexion.transaction('ficheros', modo);
-    const peticion = accion(tx.objectStore('ficheros'));
-    tx.oncomplete = () => { conexion.close(); resolve(peticion.result); };
-    tx.onerror = () => { conexion.close(); reject(tx.error); };
-  });
+export const tabla = nombre => cliente.from(nombre);
+export const rpc = (funcion, args = {}) => datos(cliente.rpc(funcion, args));
+
+
+// ---------- Caché para consultar sin conexión ----------
+
+const PREFIJO = 'cache:';
+
+export function esErrorDeRed(error) {
+  return !navigator.onLine || /failed to fetch|networkerror|load failed|network request failed/i.test(String(error?.message ?? error));
 }
 
-const leerFichero = () => idb('readonly', almacen => almacen.get('db'));
-const escribirFichero = bytes => idb('readwrite', almacen => almacen.put(bytes, 'db'));
-
-// Las escrituras se encadenan para que nunca se guarde una versión antigua encima de una nueva
-let colaGuardado = Promise.resolve();
-
-export function guardar() {
-  const bytes = db.export();
-  db.exec('PRAGMA foreign_keys = ON');   // export() reabre la conexión y se pierden los PRAGMA
-  colaGuardado = colaGuardado.then(() => escribirFichero(bytes));
-  return colaGuardado;
+function avisarConexion(hayConexion) {
+  window.dispatchEvent(new CustomEvent('estado-conexion', { detail: hayConexion }));
 }
 
-
-// ---------- Apertura y esquema ----------
-
-async function texto(ruta) {
-  const respuesta = await fetch(ruta);
-  if (!respuesta.ok) throw new Error(`No se pudo cargar ${ruta}`);
-  return respuesta.text();
-}
-
-async function prepararEsquema() {
-  db.exec(await texto('sql/schema.sql'));
-  if (versionEsquema() < 1) {
-    db.exec(await texto('sql/datos_iniciales.sql'));
-  }
-  // Aquí irán las migraciones futuras:  if (versionEsquema() < 2) { db.exec('ALTER TABLE ...') }
-  db.exec(`PRAGMA user_version = ${VERSION_ESQUEMA}`);
-}
-
-export const versionEsquema = () => consultar('PRAGMA user_version')[0].user_version;
-
-export async function abrir() {
-  SQL = await initSqlJs({ locateFile: fichero => `vendor/${fichero}` });
-  const bytes = await leerFichero();
-  db = bytes ? new SQL.Database(bytes) : new SQL.Database();
-  await prepararEsquema();
-  await guardar();
-}
-
-
-// ---------- Consultas ----------
-
-// Convierte { nombre: 'x' } en { ':nombre': 'x' }, que es lo que espera sql.js
-function parametros(p) {
-  if (Array.isArray(p)) return p;
-  return Object.fromEntries(Object.entries(p).map(([clave, valor]) => [':' + clave, valor ?? null]));
-}
-
-/** SELECT → array de objetos { columna: valor } */
-export function consultar(sql, p = {}) {
-  const sentencia = db.prepare(sql);
+/** Ejecuta una consulta de lectura; si falla por falta de red, devuelve la última copia guardada */
+export async function leer(clave, consulta) {
   try {
-    sentencia.bind(parametros(p));
-    const filas = [];
-    while (sentencia.step()) filas.push(sentencia.getAsObject());
-    return filas;
-  } finally {
-    sentencia.free();
-  }
-}
-
-/** INSERT / UPDATE / DELETE. Úsalo dentro de transaccion() para que se guarde. */
-export function ejecutar(sql, p = {}) {
-  const sentencia = db.prepare(sql);
-  try {
-    sentencia.run(parametros(p));
-  } finally {
-    sentencia.free();
-  }
-}
-
-export const ultimoId = () => consultar('SELECT last_insert_rowid() AS id')[0].id;
-
-/** Ejecuta fn() dentro de una transacción: o se aplica todo, o nada. Después guarda. */
-export async function transaccion(fn) {
-  db.exec('BEGIN');
-  let resultado;
-  try {
-    resultado = fn();
-    db.exec('COMMIT');
+    const resultado = await consulta();
+    try { localStorage.setItem(PREFIJO + clave, JSON.stringify(resultado)); } catch { /* sin espacio o modo privado */ }
+    avisarConexion(true);
+    return resultado;
   } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
+    if (!esErrorDeRed(error)) throw error;
+    let guardado = null;
+    try { guardado = JSON.parse(localStorage.getItem(PREFIJO + clave)); } catch { /* sin caché */ }
+    if (guardado === null) throw error;
+    avisarConexion(false);
+    return guardado;
   }
-  await guardar();
-  return resultado;
 }
 
-/** Consola SQL de Ajustes: ejecuta cualquier SQL y devuelve [{ columns, values }] */
-export async function consultaLibre(sql) {
-  const resultados = db.exec(sql);
-  const cambios = db.getRowsModified();
-  await guardar();
-  return { resultados, cambios };
-}
-
-
-// ---------- Copias de seguridad ----------
-
-export function exportar() {
-  const bytes = db.export();
-  db.exec('PRAGMA foreign_keys = ON');
-  return bytes;
-}
-
-export async function importar(bytes) {
-  const nueva = new SQL.Database(bytes);
+export function borrarCache() {
   try {
-    nueva.exec('SELECT 1 FROM alimentos LIMIT 1; SELECT 1 FROM recetas LIMIT 1;');
-  } catch {
-    nueva.close();
-    throw new Error('El fichero no es una copia de seguridad de Menú Semanal');
-  }
-  db.close();
-  db = nueva;
-  await prepararEsquema();
-  await guardar();
-}
-
-export async function reiniciar() {
-  db.close();
-  db = new SQL.Database();
-  await prepararEsquema();
-  await guardar();
+    Object.keys(localStorage).filter(k => k.startsWith(PREFIJO)).forEach(k => localStorage.removeItem(k));
+  } catch { /* nada que borrar */ }
 }
 
 
-// ---------- Errores de SQLite en lenguaje humano ----------
+// ---------- Errores en lenguaje humano ----------
+
+const ERRORES_ACCESO = [
+  [/invalid login credentials/i, 'Correo o contraseña incorrectos'],
+  [/email not confirmed/i, 'Confirma tu correo antes de entrar (revisa la bandeja de entrada)'],
+  [/already registered/i, 'Ya existe una cuenta con ese correo'],
+  [/password should be at least/i, 'La contraseña debe tener al menos 6 caracteres'],
+  [/rate limit|too many requests/i, 'Demasiados intentos. Espera unos minutos'],
+  [/unable to validate email|invalid format/i, 'El correo no es válido'],
+  [/jwt expired|refresh token/i, 'La sesión ha caducado. Vuelve a entrar'],
+];
 
 export function mensajeError(error) {
-  const m = String(error?.message ?? error);
-  if (m.includes('UNIQUE')) return 'Ya existe un elemento con ese nombre';
-  if (m.includes('FOREIGN KEY')) return 'No se puede: está en uso (por ejemplo, en alguna receta)';
-  if (m.includes('CHECK')) return 'Algún valor no es válido (revisa las cantidades)';
-  if (m.includes('NOT NULL')) return 'Falta algún dato obligatorio';
-  return m;
+  if (esErrorDeRed(error)) return 'Sin conexión: no se pueden guardar cambios ahora';
+  const mensaje = String(error?.message ?? error);
+  switch (error?.code) {
+    case '23505': return 'Ya existe un elemento con ese nombre';
+    case '23503': return 'No se puede: está en uso (por ejemplo, en alguna receta)';
+    case '23514': return 'Algún valor no es válido (revisa las cantidades)';
+    case '23502': return 'Falta algún dato obligatorio';
+    case '42501': return 'No tienes permiso para hacer eso';
+    case 'P0001': return mensaje;   // mensajes propios lanzados con "raise exception"
+  }
+  for (const [patron, texto] of ERRORES_ACCESO) if (patron.test(mensaje)) return texto;
+  return mensaje;
 }

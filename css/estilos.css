@@ -278,3 +278,32 @@ dialog footer .peligro[hidden] { display: none; }
 }
 .aviso.visible { opacity: 1; transform: translate(-50%, 0); }
 .aviso.error { background: var(--alerta); color: #fff; }
+
+/* ---------- Sesión, hogar y conexión ---------- */
+
+body[data-sesion="no"] .pestanas,
+body[data-sesion="no"] #btn-ajustes { display: none; }
+body[data-sesion="no"] main { padding-bottom: 32px; }
+
+.bienvenida { text-align: center; margin: 24px 0 16px; }
+.bienvenida img { border-radius: 22px; }
+.bienvenida h2 { margin-top: 8px; font-size: 1.4rem; }
+
+.formulario { display: grid; gap: 12px; }
+
+.banda {
+  position: sticky; top: calc(env(safe-area-inset-top) + 60px); z-index: 4;
+  padding: 6px 16px; text-align: center; font-size: .85rem;
+  background: var(--alerta-suave); color: var(--alerta);
+}
+
+.codigo { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 8px 0 12px; }
+.codigo strong {
+  font-family: ui-monospace, Consolas, monospace; font-size: 1.5rem; letter-spacing: .15em;
+  padding: 6px 12px; border-radius: 10px; background: var(--primario-suave); color: var(--primario);
+}
+
+.lista-simple { margin: 6px 0 10px; padding-left: 20px; }
+.lista-simple li { padding: 2px 0; }
+
+.botones [hidden] { display: none; }

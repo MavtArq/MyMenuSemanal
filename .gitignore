@@ -1,6 +1,7 @@
 # Copias de seguridad de la base de datos (contienen tus datos personales)
 *.sqlite
 *.db
+menu-semanal-*.json
 
 # Sistema y editor
 Thumbs.db
